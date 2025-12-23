@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>NYS County ↔ District Editor (non-blocking)</title>
+
+  <!-- OpenLayers -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@v9.2.4/dist/ol.css" />
+  <script src="https://cdn.jsdelivr.net/npm/ol@v9.2.4/dist/ol.js"></script>
+
+  <!-- Turf for polygon intersection -->
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; font-family: Arial, sans-serif; }
+    #map { width: calc(100vw - 360px); height: 100vh; float: left; background: black; }
+
+    /* Sidebar */
+    #sidebar {
+      width: 360px;
+      height: 100vh;
+      float: right;
+      box-sizing: border-box;
+      padding: 12px;
+      border-left: 1px solid #ccc;
+      background: #fff;
+      overflow: auto;
+    }
+
+    h2 { margin: 6px 0 12px 0; font-size: 16px; }
+    .controls { margin-bottom: 12px; }
+    #countyList { max-height: 200px; overflow:auto; border: 1px solid #ddd; padding: 6px; }
+    .county-item { display:flex; align-items:center; margin-bottom:4px; font-size:13px; }
+
+    .county-section { border-top: 1px solid #eee; padding-top:8px; margin-top:8px; }
+    .district-row { display:flex; align-items:center; margin:6px 0; gap:8px; font-size:13px; }
+    .district-name { width: 170px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight: bold; }
+
+    button { cursor:pointer; padding:6px 10px; border-radius:4px; border:1px solid #888; background:#f6f6f6; }
+    button.primary { background:#2b8cff; color:white; border-color:#1976d2; }
+    .legend { margin-top:8px; font-size:13px; }
+    .legend-item { display:flex; align-items:center; gap:8px; margin:4px 0; }
+    .swatch { width:18px; height:14px; border:1px solid #666; }
+
+    #statusMessage { margin-top:6px; color:#666; font-size:13px; }
+    .progress { margin-top:6px; font-size:13px; color:#333; }
+
+    #mapTitle {
+        position: absolute;
+        top: 20px;
+        left: 20px;
+        z-index: 1000;              /* above map layers */
+        color: white;
+        pointer-events: none;      /* clicks pass through to map */
+        text-shadow: 0 0 6px rgba(0,0,0,0.85);
+      }
+      
+      #mapTitle .title-main {
+        font-size: 60px;
+        font-weight: 800;
+        line-height: 1.1;
+      }
+      
+      #mapTitle .title-sub {
+        font-size: 40px;
+        font-weight: 700;
+        margin-top: 2px;
+      }
+      
+      #mapTitle .title-date {
+        font-size: 32px;
+        font-weight: 600;
+        margin-top: 4px;
+      }
+      
+  </style>
+</head>
+<body>
+
+  <div id="map"></div>
+
+  <div id="mapTitle">
+    <div class="title-main">New York State</div>
+    <div class="title-sub">Current School Impacts</div>
+    <div class="title-date" id="mapDate"></div>
+  </div>
+  
+  <div id="sidebar">
+    <h2>NYS District Status Editor</h2>
+
+    <div class="controls">
+      <strong>Files (expected):</strong>
+      <div>District GeoJSON: <code>NYS_Schools_3089706237687211859.geojson</code></div>
+      <div>County GeoJSON: <code>nysCounties_GeoJson.geojson</code></div>
+      <div>CSV statuses: <code>district_status.csv</code></div>
+    </div>
+
+    <div class="controls">
+      <label for="filterCounty">Filter counties:</label><br/>
+      <input id="filterCounty" placeholder="type to filter list" style="width:100%; box-sizing:border-box; padding:6px; margin-top:6px;">
+    </div>
+
+    <div id="countyList" aria-live="polite"></div>
+
+    <div style="margin-top:8px;">
+        <button id="selectAllBtn">Select All</button>
+        <button id="clearAllBtn">Clear All</button>
+        <button id="resetViewBtn">Reset View</button>
+      
+        <button id="downloadBtn" class="primary" style="float:right">
+          Download CSV
+        </button>
+      </div>
+      
+
+    <div id="selectedCountiesContainer"></div>
+
+    <div class="legend">
+      <strong><u>Class Impact</u></strong>
+      <div class="legend-item"><span class="swatch" style="background: #FFFF00"></span> Delay</div>
+      <div class="legend-item"><span class="swatch" style="background: #FF0000"></span> Closed</div>
+      <div class="legend-item"><span class="swatch" style="background: #FA6FFF"></span> Remote</div>
+      <div class="legend-item"><span class="swatch" style="background: #00B0F0"></span> Early Dismissal</div>
+      <div class="legend-item"><span class="swatch" style="background: #FFFFFF"></span> None Reported</div>
+    </div>
+
+    <div id="statusMessage">Initializing...</div>
+    <div class="progress" id="progress"></div>
+  </div>
+
+<script>
+(async function () {
+  console.log("SCRIPT STARTED");
+
+  // ---- Set map title date ----
+(function setMapDate() {
+    const d = new Date();
+    const formatted = d.toLocaleDateString("en-US", {
+      month: "long",
+      day: "2-digit",
+      year: "numeric"
+    });
+    const el = document.getElementById("mapDate");
+    if (el) el.textContent = formatted;
+  })();
+  
+
+  const DISTRICTS_GEOJSON_PATH = "NYS_Schools_3089706237687211859.geojson";
+  const COUNTIES_GEOJSON_PATH = "nysCounties_GeoJson.geojson";
+  const CSV_PATH = "district_status.csv";
+  const DISTRICT_NAME_FIELD = "SCHOOLDIST";
+  const COUNTY_NAME_FIELD = "NAME";
+  const STATUS_LIST = ["", "Delay", "Closed", "Remote", "Early Dismissal"];
+  const STATUS_COLORS = { "Delay": "#FFFF00", "Closed": "#FF0000", "Remote": "#FA6FFF","Early Dismissal": "#00B0F0" };
+  const MIN_OVERLAP_AREA_SQ_M = 2589988; // ~1 sq mile
+
+  const statusTable = {};
+  const countyToDistricts = {};
+  const districtToCounties = {};
+  let allCountyNames = [];
+  let districtFeatures = [];
+  let countyFeatures = [];
+  let defaultExtent = null;
+  let processing = false;
+  let cancelled = false;
+
+  const vectorSource = new ol.source.Vector();
+
+  const countyListDiv = document.getElementById("countyList");
+  const filterInput = document.getElementById("filterCounty");
+  const selectedContainer = document.getElementById("selectedCountiesContainer");
+  const selectAllBtn = document.getElementById("selectAllBtn");
+  const clearAllBtn = document.getElementById("clearAllBtn");
+  const downloadBtn = document.getElementById("downloadBtn");
+  const resetViewBtn = document.getElementById("resetViewBtn");
+  const statusMessageEl = document.getElementById("statusMessage");
+  const progressEl = document.getElementById("progress");
+
+  const sleep = ms => new Promise(res => setTimeout(res, ms));
+
+  function setMessage(txt){ statusMessageEl.textContent=txt||""; console.log("STATUS:",txt);}
+  function setProgress(txt){ progressEl.textContent=txt||""; console.log("PROGRESS:",txt);}
+
+  function parseCSV(text){
+    const lines=text.trim().split("\n").map(l=>l.trim()).filter(Boolean);
+    if(!lines.length) return;
+    let start=0;
+    const header=lines[0].split(",").map(s=>s.trim().toUpperCase());
+    if(header[0].includes("SCH") || header[0].includes("DIST") || header[1] && header[1].includes("STATUS")) start=1;
+    for(let i=start;i<lines.length;i++){
+      const parts=lines[i].split(",");
+      const name=parts[0]?parts[0].trim():"";
+      const status=parts[1]?parts[1].trim():"";
+      if(name) statusTable[name]=status;
+    }
+  }
+
+  try{
+    setMessage("Loading CSV...");
+    const resp=await fetch(CSV_PATH);
+    if(resp.ok){ parseCSV(await resp.text()); setMessage("CSV loaded."); }
+    else setMessage("CSV not found — you can edit statuses and download a CSV.");
+  } catch(e){ console.warn("CSV load failed:",e); setMessage("CSV not found — you can edit statuses and download a CSV."); }
+
+  function districtStyle(feature){
+    const name=feature.get(DISTRICT_NAME_FIELD);
+    const status=statusTable[name];
+    const color=status && STATUS_COLORS[status]? STATUS_COLORS[status]:"white";
+    return new ol.style.Style({
+      fill: new ol.style.Fill({ color: color }),
+      stroke: new ol.style.Stroke({ color: "#222", width: 0.8 }),
+      text: new ol.style.Text({
+        text:name,
+        font:"bold 11px sans-serif",
+        fill: new ol.style.Fill({ color:"black" }),
+        stroke: new ol.style.Stroke({ color:"white", width:2 }),
+        zIndex: 9999
+      })
+    });
+  }
+
+  const map=new ol.Map({
+    target:"map",
+    layers:[
+      new ol.layer.Vector({ source:vectorSource, style:districtStyle })
+    ],
+    view:new ol.View({ center:ol.proj.fromLonLat([-75,43]), zoom:6 })
+  });
+  
+  // ---------- Reset view button ----------
+  resetViewBtn.addEventListener("click", () => {
+    if (!defaultExtent) return;
+  
+    // clear any temporary highlight
+    selectedCountyLayer.getSource().clear();
+  
+    map.getView().fit(defaultExtent, {
+      padding: [20, 20, 20, 20],
+      duration: 400
+    });
+  });
+  
+
+  // ---------- Selected county highlight layer ----------
+  const selectedCountyLayer = new ol.layer.Vector({
+    source: new ol.source.Vector(),
+    style: new ol.style.Style({
+      stroke: new ol.style.Stroke({ color:"black", width:3 }),
+      fill: new ol.style.Fill({ color:"rgba(0,0,0,0)" })
+    })
+  });
+  map.addLayer(selectedCountyLayer);
+
+  function updateSelectedCountyLayer(){
+    const selCounties = getSelectedCountyNames();
+    const feats = countyFeatures.filter(cf => selCounties.includes(cf.get(COUNTY_NAME_FIELD)||cf.get("NAME")));
+    selectedCountyLayer.getSource().clear();
+    selectedCountyLayer.getSource().addFeatures(feats);
+  }
+
+  // ---------- Load GeoJSONs ----------
+  try{
+    setMessage("Fetching GeoJSONs...");
+    const [dResp,cResp]=await Promise.all([fetch(DISTRICTS_GEOJSON_PATH),fetch(COUNTIES_GEOJSON_PATH)]);
+    if(!dResp.ok) throw new Error("District GeoJSON fetch failed");
+    if(!cResp.ok) throw new Error("County GeoJSON fetch failed");
+    const [dJson,cJson] = await Promise.all([dResp.json(),cResp.json()]);
+    const districtFormat = new ol.format.GeoJSON();
+    const countyFormat = new ol.format.GeoJSON();
+    districtFeatures=districtFormat.readFeatures(dJson,{dataProjection:"EPSG:4326",featureProjection:"EPSG:3857"});
+    countyFeatures=countyFormat.readFeatures(cJson,{dataProjection:"EPSG:4326",featureProjection:"EPSG:3857"});
+    vectorSource.addFeatures(districtFeatures);
+
+    try {defaultExtent = vectorSource.getExtent().slice(); // SAVE IT
+        map.getView().fit(defaultExtent, { padding: [20, 20, 20, 20] });
+    } catch (e) {}
+
+    countyFeatures.forEach(c=>{ const countyName=c.get(COUNTY_NAME_FIELD)||c.get("NAME"); if(countyName && !countyToDistricts[countyName]) countyToDistricts[countyName]=[]; });
+    allCountyNames=Object.keys(countyToDistricts).sort((a,b)=>a.localeCompare(b));
+    renderCountyList();
+    setMessage("GeoJSONs downloaded — building district↔county relationships in the background. UI is responsive.");
+    processIntersectionsChunked(districtFormat,countyFormat);
+  } catch(err){ console.error(err); setMessage("Error loading GeoJSONs."); }
+
+  // ---------- County list ----------
+  function renderCountyList(filterText=""){
+    countyListDiv.innerHTML="";
+    const lower=filterText.trim().toLowerCase();
+    for(const county of allCountyNames){
+      if(lower && !county.toLowerCase().includes(lower)) continue;
+      const row=document.createElement("div"); row.className="county-item";
+      const cb=document.createElement("input"); cb.type="checkbox"; cb.dataset.county=county; cb.id="cb_"+county.replace(/\s+/g,"_");
+      cb.addEventListener("change",()=>renderSelectedCountySections());
+      const label=document.createElement("label"); label.htmlFor=cb.id; label.style.marginLeft="6px"; label.style.cursor="pointer";
+      const count=countyToDistricts[county]?countyToDistricts[county].length:0; label.textContent=county+" ("+count+")";
+      row.appendChild(cb); row.appendChild(label); countyListDiv.appendChild(row);
+    }
+  }
+
+  filterInput.addEventListener("input",(e)=>renderCountyList(e.target.value));
+  selectAllBtn.addEventListener("click",()=>{
+    countyListDiv.querySelectorAll("input[type=checkbox]").forEach(b=>b.checked=true); renderSelectedCountySections();
+  });
+  clearAllBtn.addEventListener("click",()=>{
+    countyListDiv.querySelectorAll("input[type=checkbox]").forEach(b=>b.checked=false); renderSelectedCountySections();
+  });
+
+  function getSelectedCountyNames(){
+    const sel=[]; countyListDiv.querySelectorAll("input[type=checkbox]").forEach(cb=>{if(cb.checked) sel.push(cb.dataset.county);});
+    return sel;
+  }
+
+  // ---------- Render sidebar & dropdown color ----------
+  function renderSelectedCountySections(){
+    selectedContainer.innerHTML="";
+    const selected=getSelectedCountyNames();
+    updateSelectedCountyLayer();
+    if(!selected.length){ selectedContainer.innerHTML="<div style='margin-top:8px;color:#666'>No county selected — pick one or more counties from the list above.</div>"; return; }
+    for(const county of selected){
+      const sec=document.createElement("div"); sec.className="county-section";
+      const header=document.createElement("div"); header.style.display="flex"; header.style.justifyContent="space-between"; header.style.alignItems="center";
+      const h=document.createElement("strong"); h.textContent=county+" — "+(countyToDistricts[county]?.length||0)+" districts"; header.appendChild(h);
+      const jumpBtn=document.createElement("button"); jumpBtn.textContent="Zoom"; jumpBtn.title="Zoom to county on map";
+      jumpBtn.addEventListener("click",()=>{ const f=countyFeatures.find(cf=>(cf.get(COUNTY_NAME_FIELD)||cf.get("NAME"))===county); if(f) map.getView().fit(f.getGeometry().getExtent(),{padding:[30,30,30,30]}); });
+      header.appendChild(jumpBtn); sec.appendChild(header);
+
+      const listDiv=document.createElement("div"); listDiv.style.marginTop="6px";
+      const districts = (countyToDistricts[county] || [])
+        .slice()
+        .sort((a, b) => a.localeCompare(b));
+      for(const dName of districts){
+        const row=document.createElement("div"); row.className="district-row";
+        const nameSpan=document.createElement("div"); nameSpan.className="district-name"; nameSpan.title=dName; nameSpan.textContent=dName;
+
+        const select=document.createElement("select");
+        for(const st of STATUS_LIST){ const opt=document.createElement("option"); opt.value=st; opt.textContent=st||"(none)"; if((statusTable[dName]||"")===st) opt.selected=true; select.appendChild(opt); }
+
+        const setSelectColor = () => {
+          const val=select.value;
+          if(val && STATUS_COLORS[val]){
+            const c=STATUS_COLORS[val];
+            if(c.startsWith("#")){
+              const bigint=parseInt(c.slice(1),16); const r=(bigint>>16)&255; const g=(bigint>>8)&255; const b=bigint&255;
+              select.style.backgroundColor=`rgba(${r},${g},${b},0.5)`;
+            } else select.style.backgroundColor=c.replace(")",",0.5)");
+          } else select.style.backgroundColor="";
+        };
+        setSelectColor();
+        select.addEventListener("change",()=>{
+          statusTable[dName]=select.value;
+          renderSelectedCountySections();
+          vectorSource.changed();
+        });
+
+        const zoomBtn = document.createElement("button");
+        zoomBtn.textContent = "Zoom";
+        zoomBtn.title = "Zoom to district on map";
+        zoomBtn.addEventListener("click", () => {
+
+            // ---- get ALL geometries for this district ----
+            const feats = districtFeatures.filter(
+              df => df.get(DISTRICT_NAME_FIELD) === dName
+            );
+            if (!feats.length) return;
+          
+            // ---- build a combined extent (handles enclaves/exclaves) ----
+            const combinedExtent = ol.extent.createEmpty();
+            feats.forEach(f => {
+              const geom = f.getGeometry();
+              if (geom) {
+                ol.extent.extend(combinedExtent, geom.getExtent());
+              }
+            });
+          
+            // ---- zoom so ALL parts fit on screen ----
+            map.getView().fit(combinedExtent, {
+              padding: [20, 20, 20, 20],
+              maxZoom: 13,
+              duration: 350
+            });
+          
+            // ---- highlight ALL parts of the district ----
+            const highlightStyle = new ol.style.Style({
+              fill: new ol.style.Fill({
+                color: "rgba(255,255,255,0.35)"
+              }),
+              stroke: new ol.style.Stroke({
+                color: "#000",
+                width: 3
+              }),
+              text: new ol.style.Text({
+                text: dName,
+                font: "bold 13px sans-serif",
+                fill: new ol.style.Fill({ color: "black" }),
+                stroke: new ol.style.Stroke({ color: "white", width: 4 })
+              })
+            });
+          
+            feats.forEach(f => f.setStyle(highlightStyle));
+          
+            // ---- remove highlight after a moment ----
+            setTimeout(() => {
+              feats.forEach(f => f.setStyle(null));
+            }, 1800);
+          
+          });
+          
+          
+        
+
+        row.appendChild(nameSpan);
+        row.appendChild(select);
+        row.appendChild(zoomBtn);
+        listDiv.appendChild(row);
+
+      }
+
+      sec.appendChild(listDiv); selectedContainer.appendChild(sec);
+    }
+  }
+
+  // ---------- CSV download ----------
+  function escapeCsv(s){ if(s==null) return""; if(s.includes(",")||s.includes('"')||s.includes("\n")) return '"'+s.replace(/"/g,'""')+'"'; return s;}
+  function downloadCSV(){ 
+    const districtNames=Array.from(new Set(districtFeatures.map(f=>f.get(DISTRICT_NAME_FIELD)).filter(Boolean))).sort((a,b)=>a.localeCompare(b));
+    const rows=[["SCHOOLDIST","status"]];
+    for(const n of districtNames) rows.push([escapeCsv(n),escapeCsv(statusTable[n]||"")]);
+    const csv=rows.map(r=>r.join(",")).join("\n");
+    const blob=new Blob([csv],{type:"text/csv;charset=utf-8;"}); const url=URL.createObjectURL(blob);
+    const a=document.createElement("a"); a.href=url; a.download="district_status_updated.csv"; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+  }
+  downloadBtn.addEventListener("click",downloadCSV);
+
+  // ---------- Chunked intersection ----------
+  async function processIntersectionsChunked(districtFormat,countyFormat){
+    if(processing) return; processing=true; cancelled=false;
+    const totalCounties=countyFeatures.length;
+    setProgress(`Preparing intersections for ${totalCounties} counties...`);
+
+    const districtGeoJsons=districtFeatures.map(df=>({ name:df.get(DISTRICT_NAME_FIELD), geo:districtFormat.writeFeatureObject(df,{featureProjection:"EPSG:3857",dataProjection:"EPSG:4326"}) }));
+
+    for(let ci=0;ci<countyFeatures.length;ci++){
+      if(cancelled) break;
+      const countyFeat=countyFeatures[ci]; const countyName=countyFeat.get(COUNTY_NAME_FIELD)||countyFeat.get("NAME"); if(!countyName) continue;
+      const countyGeo=countyFormat.writeFeatureObject(countyFeat,{featureProjection:"EPSG:3857",dataProjection:"EPSG:4326"});
+      if(!countyToDistricts[countyName]) countyToDistricts[countyName]=[];
+      const chunkSize=60;
+      for(let start=0;start<districtGeoJsons.length;start+=chunkSize){
+        if(cancelled) break;
+        const chunk=districtGeoJsons.slice(start,start+chunkSize);
+        for(const d of chunk){
+          if(!d.name) continue;
+          if(countyToDistricts[countyName].includes(d.name)) continue;
+          try{
+            let intersects=false;
+            try{
+              const tInt=turf.intersect(d.geo,countyGeo);
+              if(tInt && turf.area(tInt)>=MIN_OVERLAP_AREA_SQ_M) intersects=true;
+            } catch(e){ console.warn("Turf intersect failed:",e); }
+            if(intersects) { countyToDistricts[countyName].push(d.name); districtToCounties[d.name]=districtToCounties[d.name]||[]; districtToCounties[d.name].push(countyName); }
+          } catch(e){ console.warn(e); }
+        }
+        setProgress(`Processing county ${ci+1}/${totalCounties} (${countyName}): districts ${Math.min(start+chunkSize,districtGeoJsons.length)}/${districtGeoJsons.length} checked`);
+        await sleep(10);
+      }
+    }
+    setMessage("District↔County processing completed.");
+    renderCountyList(filterInput.value); renderSelectedCountySections();
+    processing=false;
+  }
+
+})();
+</script>
+</body>
+</html>
